@@ -4,5 +4,6 @@ pydantic
 typing 
 datetime 
 passlib
-jose
-jwt
+
+python-jose[cryptography]
+passlib[bcrypt]
