@@ -4,6 +4,6 @@ pydantic
 typing 
 datetime 
 passlib
-
+python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
