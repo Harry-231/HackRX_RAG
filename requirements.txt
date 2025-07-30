@@ -1,0 +1,8 @@
+fastapi
+uvicorn 
+pydantic 
+typing 
+datetime 
+passlib
+jose
+jwt
