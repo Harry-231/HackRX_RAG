@@ -26,3 +26,15 @@ langchain-openai
 langchain-voyageai
 langchain-mongodb
 pymongo
+bs4
+concurrent
+logging
+typing
+dataclasses
+fitz
+nltk
+uuid
+collections 
+bs4
+pydantic
+
