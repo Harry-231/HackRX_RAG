@@ -26,4 +26,3 @@ langchain-openai
 langchain-voyageai
 langchain-mongodb
 pymongo
-```
