@@ -50,7 +50,7 @@ class QueryResponse(BaseModel):
 
 # API Key validation
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    expected_key = os.getenv("API_KEY", "your-secret-api-key")
+    expected_key = os.getenv("SECRET_KEY")
     if credentials.credentials != expected_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
