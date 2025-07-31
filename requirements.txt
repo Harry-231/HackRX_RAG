@@ -17,7 +17,7 @@ pydantic
 nest_asyncio
 python-dotenv
 requests
-pymupdf
+PyMuPDF
 pdfplumber
 nltk
 langchain
@@ -30,10 +30,10 @@ bs4
 logging
 typing
 dataclasses
-fitz
+
 nltk
 uuid
-frontend
+
 bs4
 pydantic
 
