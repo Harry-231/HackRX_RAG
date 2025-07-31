@@ -33,7 +33,7 @@ dataclasses
 fitz
 nltk
 uuid
-
+frontend
 bs4
 pydantic
 
