@@ -27,7 +27,6 @@ langchain-voyageai
 langchain-mongodb
 pymongo
 bs4
-concurrent
 logging
 typing
 dataclasses
