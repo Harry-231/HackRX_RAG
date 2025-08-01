@@ -34,7 +34,7 @@ dataclasses
 scikit-learn
 nltk
 uuid
-
+rank_bm25
 bs4
 pydantic
 
