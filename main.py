@@ -79,7 +79,7 @@ async def process_query(
         # Process with timeout
         answers = await asyncio.wait_for(
             rag_service.run(documents_url, request.questions),
-            timeout=60.0  # 40 second timeout
+            timeout=900.0  # 40 second timeout
         )
         
         return QueryResponse(answers=answers)

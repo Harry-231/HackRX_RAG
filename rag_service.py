@@ -120,7 +120,7 @@ class PDFParser:
             # Use a session for connection pooling and increased timeout
             with requests.Session() as session:
                 session.headers.update(headers)
-                response = session.get(url, timeout=60, stream=True)
+                response = session.get(url, timeout=900, stream=True)
                 response.raise_for_status()
                 
                 # Read content in chunks for better memory usage
@@ -890,10 +890,7 @@ class OptimizedRAGService:
                 os.getenv("MONGODB_URI"),
                 maxPoolSize=50,  # Increase connection pool
                 minPoolSize=10,
-                maxIdleTimeMS=30000,
-                serverSelectionTimeoutMS=5000,
-                socketTimeoutMS=20000,
-                connectTimeoutMS=20000,
+                
                 retryWrites=True,
                 w="majority"
             )
