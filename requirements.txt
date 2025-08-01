@@ -31,7 +31,7 @@ bs4
 logging
 typing
 dataclasses
-
+sklearn
 nltk
 uuid
 
