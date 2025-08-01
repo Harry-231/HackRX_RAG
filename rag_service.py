@@ -1,23 +1,23 @@
-# rag_service.py
+# rag_service.py - Updated with Ensemble Retriever and Enhanced Caching
 
 import os
 import asyncio
 import nest_asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,as_completed
 import logging
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import re
 import requests
-import tempfile
-import fitz  # PyMuPDF
-import pdfplumber
-import nltk
-from bs4 import BeautifulSoup
+from io import BytesIO
+import threading
+import hashlib
 from uuid import uuid4
-from collections import defaultdict
-from langchain_core.retrievers import BaseRetriever
-from pydantic import PrivateAttr
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from functools import lru_cache
+import time
+
 # Environment setup
 from dotenv import load_dotenv
 load_dotenv()
@@ -35,829 +35,780 @@ logger = logging.getLogger(__name__)
 # Thread pool for CPU-intensive operations
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Download required NLTK data (run once)
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    import fitz  # PyMuPDF
+    import nltk
+    from sentence_transformers import SentenceTransformer
+    # Download required NLTK data (run once)
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
+except ImportError as e:
+    logger.warning(f"Some dependencies not available: {e}")
 
 @dataclass
-class DocumentChunk:
-    """Represents a semantic chunk of the document."""
-    id: str
-    title: str
-    content: str
-    section_path: str
-    chunk_type: str  # 'text', 'table', 'list', 'definition', 'bullet_points'
-    metadata: Dict
-    semantic_score: float = 0.0  # Coherence score
-    keywords: List[str] = field(default_factory=list)
+class Document:
+    """Document object similar to langchain_core.documents.Document"""
+    page_content: str
+    metadata: Dict[str, Any]
 
-class FinancialPDFParser:
-    """Enhanced PDF parser optimized for financial policy documents with complex layouts and tables."""
+@dataclass
+class Chunk:
+    """Represents a document chunk with metadata"""
+    content: str
+    metadata: Dict[str, Any]
+    chunk_id: str
+    start_char: int
+    end_char: int
+
+class PDFParser:
+    """
+    Optimized PDF Parser using PyMuPDF for extracting text and tables from PDFs loaded from URLs.
+    Optimized for RAG applications with semantic chunking in mind.
+    """
     
     def __init__(self, 
-                 table_detection_threshold: int = 3,
-                 min_table_rows: int = 2,
-                 min_table_cols: int = 2,
-                 preserve_formatting: bool = True):
-        self.table_detection_threshold = table_detection_threshold
-        self.min_table_rows = min_table_rows
-        self.min_table_cols = min_table_cols
-        self.preserve_formatting = preserve_formatting
+                 table_strategy: str = "lines",
+                 min_words_vertical: int = 3,
+                 min_words_horizontal: int = 1,
+                 snap_tolerance: float = 3.0,
+                 max_workers: int = 4):
+        """
+        Initialize the PDF parser with table detection parameters.
+        
+        Args:
+            table_strategy: Strategy for table detection ("lines", "lines_strict", "text")
+            min_words_vertical: Minimum words to establish virtual column boundary
+            min_words_horizontal: Minimum words to establish virtual row boundary
+            snap_tolerance: Tolerance for snapping lines together
+            max_workers: Maximum number of worker threads for parallel processing
+        """
+        self.table_strategy = table_strategy
+        self.min_words_vertical = min_words_vertical
+        self.min_words_horizontal = min_words_horizontal
+        self.snap_tolerance = snap_tolerance
+        self.max_workers = max_workers
+        
+        # Pre-compile regex patterns for better performance
+        self._whitespace_pattern = re.compile(r'\s+')
+        self._artifact_pattern = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]')
+        
+        # Thread-local storage for PDF documents to avoid threading issues
+        self._local = threading.local()
     
-    def download_pdf(self, url: str, timeout: int = 30) -> str:
-        """Download PDF from a URL to a temporary local file with better error handling."""
+    def fetch_pdf_from_url(self, url: str) -> bytes:
+        """
+        Fetch PDF content from a URL with optimized settings.
+        
+        Args:
+            url: URL of the PDF file
+            
+        Returns:
+            PDF content as bytes
+            
+        Raises:
+            requests.RequestException: If URL fetch fails
+        """
         try:
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept-Encoding': 'gzip, deflate',  # Enable compression
+                'Connection': 'keep-alive'
             }
-            response = requests.get(url, timeout=timeout, headers=headers, stream=True)
-            response.raise_for_status()
             
-            # Check if content is actually a PDF
-            content_type = response.headers.get('content-type', '').lower()
-            if 'pdf' not in content_type:
-                # Check magic number for PDF
-                first_bytes = response.content[:4]
-                if not first_bytes.startswith(b'%PDF'):
-                    raise ValueError("Downloaded content is not a valid PDF")
-            
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            tmp_file.write(response.content)
-            tmp_file.flush()
-            tmp_file.close()
-            
-            logger.info(f"Downloaded PDF: {len(response.content)} bytes")
-            return tmp_file.name
-            
-        except requests.exceptions.RequestException as e:
-            raise ValueError(f"Failed to download PDF: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Error processing PDF download: {str(e)}")
+            # Use a session for connection pooling and increased timeout
+            with requests.Session() as session:
+                session.headers.update(headers)
+                response = session.get(url, timeout=60, stream=True)
+                response.raise_for_status()
+                
+                # Read content in chunks for better memory usage
+                content = BytesIO()
+                for chunk in response.iter_content(chunk_size=8192):
+                    content.write(chunk)
+                
+                pdf_bytes = content.getvalue()
+                
+                # Verify it's a PDF
+                if not pdf_bytes.startswith(b'%PDF'):
+                    raise ValueError("URL does not point to a valid PDF file")
+                    
+                return pdf_bytes
+                
+        except requests.RequestException as e:
+            raise requests.RequestException(f"Failed to fetch PDF from URL: {e}")
     
     def clean_text(self, text: str) -> str:
-        """Clean and normalize text from PDF extraction."""
+        """
+        Clean extracted text for better semantic processing using pre-compiled patterns.
+        
+        Args:
+            text: Raw text to clean
+            
+        Returns:
+            Cleaned text
+        """
         if not text:
             return ""
         
-        # Remove excessive whitespace but preserve paragraph breaks
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r'[ \t]+', ' ', text)
+        # Use pre-compiled regex patterns for better performance
+        text = self._whitespace_pattern.sub(' ', text)
+        text = text.strip()
         
-        # Fix common OCR/extraction issues
-        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # Add space between camelCase
-        text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)  # Space between numbers and letters
-        text = re.sub(r'([A-Za-z])(\d)', r'\1 \2', text)  # Space between letters and numbers
+        # Remove common PDF artifacts
+        text = self._artifact_pattern.sub('', text)
         
-        # Clean up bullet points and list formatting
-        text = re.sub(r'•\s*', '• ', text)
-        text = re.sub(r'^\s*[\-\*]\s*', '• ', text, flags=re.MULTILINE)
-        
-        return text.strip()
+        return text
     
-    def detect_table_indicators(self, text: str) -> Dict[str, bool]:
-        """Advanced table detection using multiple heuristics for financial documents."""
-        lines = text.splitlines()
+    def extract_text_from_page(self, page) -> str:
+        """
+        Extract clean text from a PDF page.
         
-        indicators = {
-            'alignment_patterns': False,
-            'numeric_columns': False,
-            'financial_keywords': False,
-            'separator_lines': False,
-            'consistent_spacing': False
+        Args:
+            page: PyMuPDF page object
+            
+        Returns:
+            Cleaned text content
+        """
+        # Extract text with layout preservation
+        text = page.get_text("text")
+        return self.clean_text(text)
+    
+    def extract_tables_from_page(self, page) -> List[str]:
+        """
+        Extract tables from a PDF page and convert to markdown format.
+        
+        Args:
+            page: PyMuPDF page object
+            
+        Returns:
+            List of tables in markdown format
+        """
+        tables_markdown = []
+        
+        try:
+            # Find tables using the specified strategy
+            table_finder = page.find_tables(
+                strategy=self.table_strategy,
+                min_words_vertical=self.min_words_vertical,
+                min_words_horizontal=self.min_words_horizontal,
+                snap_tolerance=self.snap_tolerance
+            )
+            
+            # Pre-allocate list if we know the size
+            if hasattr(table_finder, 'tables'):
+                tables_count = len(table_finder.tables)
+                if tables_count > 0:
+                    tables_markdown = []  # Will append as we go
+                    
+                    # Extract each table as markdown
+                    for table_idx, table in enumerate(table_finder.tables):
+                        try:
+                            # Get markdown representation optimized for LLM/RAG
+                            markdown_table = table.to_markdown()
+                            
+                            if markdown_table and markdown_table.strip():
+                                # Use f-string for better performance than concatenation
+                                formatted_table = f"\n**Table {table_idx + 1}** (Rows: {table.row_count}, Columns: {table.col_count})\n\n{markdown_table}\n"
+                                tables_markdown.append(formatted_table)
+                                
+                        except Exception as e:
+                            print(f"Warning: Failed to extract table {table_idx + 1}: {e}")
+                            continue
+                    
+        except Exception as e:
+            print(f"Warning: Table detection failed on page: {e}")
+        
+        return tables_markdown
+    
+    def process_single_page(self, page_data: tuple) -> Document:
+        """
+        Process a single page (used for parallel processing).
+        
+        Args:
+            page_data: Tuple of (page_num, page, pdf_metadata, url)
+            
+        Returns:
+            Document object
+        """
+        page_num, page, pdf_metadata, url = page_data
+        
+        try:
+            # Extract text
+            text = self.extract_text_from_page(page)
+            
+            # Extract tables
+            tables = self.extract_tables_from_page(page)
+            
+            # Create document object
+            doc = self.create_page_document(
+                page_num=page_num,
+                text=text,
+                tables=tables,
+                pdf_metadata=pdf_metadata,
+                url=url
+            )
+            
+            return doc
+            
+        except Exception as e:
+            print(f"Error processing page {page_num + 1}: {e}")
+            # Return empty document to maintain page order
+            return Document(
+                page_content="",
+                metadata={
+                    "source": url,
+                    "page": page_num + 1,
+                    "page_index": page_num,
+                    "error": str(e),
+                    **pdf_metadata
+                }
+            )
+    
+    def create_page_document(self, 
+                           page_num: int, 
+                           text: str, 
+                           tables: List[str], 
+                           pdf_metadata: Dict[str, Any],
+                           url: str) -> Document:
+        """
+        Create a Document object for a single page with optimized string operations.
+        
+        Args:
+            page_num: Page number (0-indexed)
+            text: Extracted text content
+            tables: List of tables in markdown format
+            pdf_metadata: PDF metadata
+            url: Source URL
+            
+        Returns:
+            Document object
+        """
+        # Use list for efficient string building
+        page_content_parts = []
+        
+        if text:
+            page_content_parts.append(f"**Page {page_num + 1} Content:**\n\n{text}")
+        
+        if tables:
+            page_content_parts.append(f"\n**Tables on Page {page_num + 1}:**\n")
+            page_content_parts.extend(tables)
+        
+        # Join once for better performance
+        page_content = "".join(page_content_parts)
+        
+        # Create comprehensive metadata for RAG
+        text_length = len(text)
+        metadata = {
+            "source": url,
+            "page": page_num + 1,
+            "page_index": page_num,
+            "content_type": "pdf_page",
+            "has_tables": len(tables) > 0,
+            "table_count": len(tables),
+            "text_length": text_length,
+            "total_content_length": len(page_content),
+            **pdf_metadata
         }
         
-        # Check for alignment patterns (multiple spaces or tabs)
-        aligned_lines = sum(1 for line in lines if line.count('  ') >= self.table_detection_threshold or '\t' in line)
-        indicators['alignment_patterns'] = aligned_lines >= 2
+        return Document(page_content=page_content, metadata=metadata)
+    
+    def parse_pdf_from_url(self, url: str, use_parallel: bool = True) -> List[Document]:
+        """
+        Parse a PDF from URL and return list of Document objects with optional parallel processing.
         
-        # Check for numeric columns (financial data patterns)
-        numeric_pattern = re.compile(r'[\d,]+\.?\d*%?|\$[\d,]+\.?\d*|[\d,]+\.?\d*\s*(?:million|billion|trillion|M|B|T)')
-        numeric_lines = sum(1 for line in lines if len(numeric_pattern.findall(line)) >= 2)
-        indicators['numeric_columns'] = numeric_lines >= 2
-        
-        # Check for financial keywords that often appear in tables
-        financial_keywords = [
-            'total', 'amount', 'balance', 'revenue', 'expense', 'profit', 'loss',
-            'assets', 'liabilities', 'equity', 'cash', 'investment', 'rate',
-            'percentage', 'year', 'quarter', 'month', 'date', 'period'
-        ]
-        keyword_pattern = re.compile(r'\b(?:' + '|'.join(financial_keywords) + r')\b', re.IGNORECASE)
-        has_keywords = any(keyword_pattern.search(line) for line in lines[:10])  # Check first few lines
-        indicators['financial_keywords'] = has_keywords
-        
-        # Check for separator lines (dashes, equals, underscores)
-        separator_pattern = re.compile(r'^[\s\-=_]{10,}$')
-        has_separators = any(separator_pattern.match(line) for line in lines)
-        indicators['separator_lines'] = has_separators
-        
-        # Check for consistent spacing patterns
-        if len(lines) >= 3:
-            space_patterns = []
-            for line in lines[:10]:  # Check first 10 lines
-                spaces = [m.start() for m in re.finditer(r'\s{2,}', line)]
-                if len(spaces) >= 2:
-                    space_patterns.append(spaces)
+        Args:
+            url: URL of the PDF file
+            use_parallel: Whether to use parallel processing for pages
             
-            # If multiple lines have similar spacing patterns, likely a table
-            if len(space_patterns) >= 2:
-                indicators['consistent_spacing'] = True
-        
-        return indicators
-    
-    def is_likely_table_page(self, text: str) -> bool:
-        """Determine if a page likely contains tables based on multiple indicators."""
-        indicators = self.detect_table_indicators(text)
-        
-        # Weighted scoring system
-        score = 0
-        if indicators['alignment_patterns']:
-            score += 3
-        if indicators['numeric_columns']:
-            score += 4  # Strong indicator for financial docs
-        if indicators['financial_keywords']:
-            score += 2
-        if indicators['separator_lines']:
-            score += 2
-        if indicators['consistent_spacing']:
-            score += 3
-        
-        return score >= 4  # Threshold for table detection
-    
-    def extract_tables_with_context(self, page) -> List[Dict]:
-        """Extract tables with better formatting and context preservation."""
-        tables_data = []
+        Returns:
+            List of Document objects, one per page
+            
+        Raises:
+            Exception: If PDF parsing fails
+        """
+        documents = []
         
         try:
-            tables = page.extract_tables(table_settings={
-                "vertical_strategy": "lines_strict",
-                "horizontal_strategy": "lines_strict",
-                "snap_tolerance": 3,
-                "join_tolerance": 3,
-                "edge_min_length": 3,
-                "min_words_vertical": 1,
-                "min_words_horizontal": 1,
-                "intersection_tolerance": 3
-            })
+            # Fetch PDF content
+            pdf_content = self.fetch_pdf_from_url(url)
             
-            for i, table in enumerate(tables):
-                if not table or len(table) < self.min_table_rows:
-                    continue
-                
-                # Filter out tables with too few columns
-                max_cols = max(len(row) for row in table if row)
-                if max_cols < self.min_table_cols:
-                    continue
-                
-                # Clean and format table
-                cleaned_table = []
-                for row in table:
-                    cleaned_row = []
-                    for cell in row:
-                        if cell is None:
-                            cleaned_row.append("")
-                        else:
-                            # Clean cell content
-                            cell_content = str(cell).strip()
-                            cell_content = re.sub(r'\s+', ' ', cell_content)
-                            cleaned_row.append(cell_content)
-                    cleaned_table.append(cleaned_row)
-                
-                # Create formatted table string
-                table_str = self._format_table(cleaned_table)
-                
-                tables_data.append({
-                    'index': i,
-                    'table': table_str,
-                    'rows': len(cleaned_table),
-                    'cols': max_cols
-                })
-                
-        except Exception as e:
-            logger.warning(f"Error extracting tables: {str(e)}")
-        
-        return tables_data
-    
-    def _format_table(self, table: List[List[str]]) -> str:
-        """Format table with proper alignment for better readability."""
-        if not table:
-            return ""
-        
-        # Calculate column widths
-        col_widths = []
-        max_cols = max(len(row) for row in table)
-        
-        for col in range(max_cols):
-            max_width = 0
-            for row in table:
-                if col < len(row) and row[col]:
-                    max_width = max(max_width, len(str(row[col])))
-            col_widths.append(min(max_width, 30))  # Cap column width
-        
-        # Format rows
-        formatted_rows = []
-        for row in table:
-            formatted_cells = []
-            for col in range(max_cols):
-                cell = row[col] if col < len(row) else ""
-                formatted_cells.append(str(cell).ljust(col_widths[col]))
-            formatted_rows.append(" | ".join(formatted_cells).rstrip())
-        
-        return "\n".join(formatted_rows)
-    
-    def extract_page_content(self, fitz_page, plumber_page, page_num: int) -> Dict:
-        """Extract content from a single page with enhanced processing."""
-        try:
-            # Get text using PyMuPDF (faster)
-            text = fitz_page.get_text("text").strip()
+            # Open PDF document
+            pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
             
-            # Get text with layout preservation if needed
-            if self.preserve_formatting:
-                layout_text = fitz_page.get_text("dict")
-                # Process layout information if needed for complex documents
-            
-            # Clean the text
-            cleaned_text = self.clean_text(text)
-            
-            page_info = {
-                'text': cleaned_text,
-                'tables': [],
-                'has_tables': False,
-                'metadata': {
-                    'page': page_num,
-                    'word_count': len(cleaned_text.split()),
-                    'char_count': len(cleaned_text)
-                }
+            # Extract PDF metadata once
+            pdf_metadata = {
+                "title": pdf_doc.metadata.get("title", ""),
+                "author": pdf_doc.metadata.get("author", ""),
+                "subject": pdf_doc.metadata.get("subject", ""),
+                "creator": pdf_doc.metadata.get("creator", ""),
+                "producer": pdf_doc.metadata.get("producer", ""),
+                "creation_date": pdf_doc.metadata.get("creationDate", ""),
+                "modification_date": pdf_doc.metadata.get("modDate", ""),
+                "total_pages": pdf_doc.page_count
             }
             
-            # Check if page likely contains tables
-            if self.is_likely_table_page(cleaned_text):
-                logger.info(f"Detected potential tables on page {page_num}")
-                tables_data = self.extract_tables_with_context(plumber_page)
-                
-                if tables_data:
-                    page_info['tables'] = tables_data
-                    page_info['has_tables'] = True
-                    page_info['metadata']['table_count'] = len(tables_data)
+            if use_parallel and pdf_doc.page_count > 3:
+                # Parallel processing for larger documents
+                documents = self._process_pages_parallel(pdf_doc, pdf_metadata, url)
+            else:
+                # Sequential processing for smaller documents or when parallel is disabled
+                documents = self._process_pages_sequential(pdf_doc, pdf_metadata, url)
             
-            return page_info
+            pdf_doc.close()
             
         except Exception as e:
-            logger.error(f"Error processing page {page_num}: {str(e)}")
-            return {
-                'text': f"Error processing page {page_num}: {str(e)}",
-                'tables': [],
-                'has_tables': False,
-                'metadata': {'page': page_num, 'error': True}
-            }
-    
-    def parse_document(self, url: str) -> List[Dict]:
-        """Main parsing function with comprehensive error handling and cleanup."""
-        pdf_path = None
+            if 'pdf_doc' in locals():
+                pdf_doc.close()
+            raise Exception(f"Failed to parse PDF: {e}")
         
-        try:
-            pdf_path = self.download_pdf(url)
-            parsed_pages = []
+        return documents
+    
+    def _process_pages_sequential(self, pdf_doc, pdf_metadata: Dict[str, Any], url: str) -> List[Document]:
+        """Process pages sequentially."""
+        documents = []
+        
+        for page_num in range(pdf_doc.page_count):
+            try:
+                page = pdf_doc[page_num]
+                doc = self.process_single_page((page_num, page, pdf_metadata, url))
+                documents.append(doc)
+                print(f"Processed page {page_num + 1}/{pdf_doc.page_count}")
+            except Exception as e:
+                print(f"Error processing page {page_num + 1}: {e}")
+                continue
+        
+        return documents
+    
+    def _process_pages_parallel(self, pdf_doc, pdf_metadata: Dict[str, Any], url: str) -> List[Document]:
+        """Process pages in parallel."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        documents = [None] * pdf_doc.page_count  # Pre-allocate list
+        
+        # Prepare page data for parallel processing
+        page_data_list = []
+        for page_num in range(pdf_doc.page_count):
+            page = pdf_doc[page_num]
+            page_data_list.append((page_num, page, pdf_metadata, url))
+        
+        # Process pages in parallel
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, pdf_doc.page_count)) as executor:
+            # Submit all tasks
+            future_to_page = {
+                executor.submit(self.process_single_page, page_data): page_data[0] 
+                for page_data in page_data_list
+            }
             
-            with fitz.open(pdf_path) as doc_fitz, pdfplumber.open(pdf_path) as doc_plumber:
-                total_pages = len(doc_fitz)
-                logger.info(f"Processing {total_pages} pages")
-                
-                for i, (fitz_page, plumber_page) in enumerate(zip(doc_fitz, doc_plumber.pages)):
-                    page_num = i + 1
-                    page_info = self.extract_page_content(fitz_page, plumber_page, page_num)
-                    
-                    # Combine text and tables
-                    content_parts = [page_info['text']]
-                    
-                    if page_info['has_tables']:
-                        content_parts.append("\n\n--- EXTRACTED TABLES ---\n")
-                        for table_data in page_info['tables']:
-                            content_parts.append(f"\nTable {table_data['index'] + 1}:")
-                            content_parts.append(f"({table_data['rows']} rows × {table_data['cols']} columns)")
-                            content_parts.append(table_data['table'])
-                            content_parts.append("")
-                    
-                    full_content = "\n".join(content_parts).strip()
-                    
-                    parsed_pages.append({
-                        "page_content": full_content,
-                        "tables": page_info['tables'] if page_info['has_tables'] else [],
-                        "metadata": {
-                            'source': url,
-                            'page': page_num,
-                            'total_pages': total_pages,
-                            'has_tables': page_info['has_tables'],
-                            'word_count': page_info['metadata']['word_count'],
-                            'char_count': page_info['metadata']['char_count']
-                        }
-                    })
-            
-            logger.info(f"Successfully processed {len(parsed_pages)} pages")
-            return parsed_pages
-            
-        except Exception as e:
-            logger.error(f"Error parsing document: {str(e)}")
-            raise
-            
-        finally:
-            # Clean up temporary file
-            if pdf_path and os.path.exists(pdf_path):
+            # Collect results as they complete
+            completed_count = 0
+            for future in as_completed(future_to_page):
+                page_num = future_to_page[future]
                 try:
-                    os.unlink(pdf_path)
-                    logger.info("Cleaned up temporary PDF file")
+                    doc = future.result()
+                    documents[page_num] = doc  # Maintain page order
+                    completed_count += 1
+                    print(f"Processed page {page_num + 1}/{pdf_doc.page_count} ({completed_count} completed)")
                 except Exception as e:
-                    logger.warning(f"Could not clean up temporary file: {str(e)}")
+                    print(f"Error processing page {page_num + 1}: {e}")
+        
+        # Filter out None values (failed pages)
+        return [doc for doc in documents if doc is not None]
 
-class ImprovedInsurancePDFChunker:
-    """Enhanced PDF chunker with semantic awareness for insurance documents."""
+class FinancialPolicyChunker:
+    """
+    Optimized chunking strategy for financial policy documents.
+    Combines hierarchical and semantic chunking for optimal RAG performance.
+    """
     
-    def __init__(self, max_chunk_size: int = 800, min_chunk_size: int = 200, chunk_overlap: int = 100):
-        self.chunk_counter = 0
-        self.chunks: List[DocumentChunk] = []
+    def __init__(self, 
+                 target_chunk_size: int = 1000,
+                 max_chunk_size: int = 1500,
+                 min_chunk_size: int = 200,
+                 overlap_size: int = 100,
+                 semantic_threshold: float = 0.3,
+                 use_semantic_model: bool = False):
+        """
+        Initialize the chunker with optimal parameters for financial documents.
+        """
+        self.target_chunk_size = target_chunk_size
         self.max_chunk_size = max_chunk_size
         self.min_chunk_size = min_chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.overlap_size = overlap_size
+        self.semantic_threshold = semantic_threshold
+        self.use_semantic_model = use_semantic_model
         
-        # Insurance-specific patterns
+        # Initialize semantic model if requested
+        self.semantic_model = None
+        if use_semantic_model:
+            try:
+                self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+            except:
+                print("Warning: Could not load semantic model, falling back to rule-based chunking")
+        
+        # Common section patterns in financial policies
         self.section_patterns = [
-            r'^[A-Z][A-Z\s\-:]{3,}$',  # ALL CAPS headers
-            r'^\d+\.\s+[A-Z][A-Za-z\s\-:]{3,}$',  # Numbered sections
-            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*:?\s*$',  # Title Case
-            r'^SECTION\s+\d+',  # Section markers
-            r'^ARTICLE\s+\d+',  # Article markers
-            r'^PART\s+[A-Z0-9]+',  # Part markers
-            r'^\*{2,}.*\*{2,}$',  # Markdown-style headers
+            r'^(\d+\.?\d*)\s+(PREAMBLE|DEFINITIONS|COVERAGE|EXCLUSIONS|CONDITIONS|CLAIMS|PREMIUM)',
+            r'^(\d+\.?\d*)\s+([A-Z][A-Z\s&-]+)$',  # Numbered sections
+            r'^([A-Z][A-Z\s&-]+):?\s*$',  # All caps headings
+            r'^\*\*([^*]+)\*\*$',  # Bold headings from markdown
+            r'^(Table of Benefits|Benefits|Features|Plans):',  # Table headers
+            r'^(Optional covers|Add-ons|Discounts):',  # Policy sections
         ]
         
-        self.definition_patterns = [
-            r'^"([^"]+)"\s+means\s+',  # "Term" means definition
-            r'^([A-Z][a-zA-Z\s]+):\s+',  # Term: definition
-            r'^Definition of\s+([^:]+):',  # Definition of term:
+        # Sentence boundary patterns
+        self.sentence_endings = r'[.!?]\s+(?=[A-Z])'
+        
+        # Table detection patterns
+        self.table_patterns = [
+            r'\*\*Table \d+\*\*',
+            r'\|.*\|.*\|',  # Markdown table rows
+            r'^\s*\|[-:]+\|',  # Table separators
         ]
-        
-        self.list_patterns = [
-            r'^\s*[\-\*\+]\s+',  # Bullet points
-            r'^\s*\d+[\.\)]\s+',  # Numbered lists
-            r'^\s*[a-zA-Z][\.\)]\s+',  # Lettered lists
-            r'^\s*[ivxlcdm]+[\.\)]\s+',  # Roman numerals
-        ]
-
-    def process_parsed_pages(self, pages: List[Dict]) -> List[DocumentChunk]:
-        """Enhanced processing with better semantic awareness"""
-        self.chunks = []
-        current_section_hierarchy = ["General"]
-        accumulated_content = []
-        
-        for page_index, page in enumerate(pages):
-            text = page.get("page_content", "")
-            tables = page.get("tables", [])
-            
-            # Process text with enhanced semantic chunking
-            self._process_page_text(text, page_index, current_section_hierarchy, accumulated_content)
-            
-            # Process tables
-            self._process_tables(tables, page_index, current_section_hierarchy)
-        
-        # Process any remaining content
-        if accumulated_content:
-            self._create_semantic_chunks(accumulated_content, current_section_hierarchy)
-        
-        # Post-process chunks for quality
-        self._post_process_chunks()
-        
-        return self.chunks
-
-    def _process_page_text(self, text: str, page_index: int, section_hierarchy: List[str], accumulated_content: List[str]):
-        """Process page text with semantic awareness"""
+    
+    def identify_document_structure(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Identify hierarchical structure in the document.
+        """
+        sections = []
         lines = text.split('\n')
-        current_block = []
+        current_pos = 0
         
-        for line in lines:
-            line = line.strip()
-            if not line:
-                if current_block:
-                    accumulated_content.extend(current_block)
-                    current_block = []
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            if not line_stripped:
+                current_pos += len(line) + 1
                 continue
             
-            # Check if this is a section header
-            header_info = self._detect_section_header(line)
-            if header_info:
-                # Process accumulated content before starting new section
-                if accumulated_content:
-                    self._create_semantic_chunks(accumulated_content, section_hierarchy)
-                    accumulated_content = []
-                
-                # Update section hierarchy
-                level, title = header_info
-                self._update_section_hierarchy(section_hierarchy, level, title)
+            # Check for section headers
+            section_match = None
+            section_type = "content"
+            
+            for pattern in self.section_patterns:
+                match = re.match(pattern, line_stripped, re.IGNORECASE)
+                if match:
+                    section_match = match
+                    if any(keyword in line_stripped.upper() for keyword in 
+                          ['DEFINITION', 'COVERAGE', 'EXCLUSION', 'CLAIM', 'PREMIUM', 'BENEFIT']):
+                        section_type = "policy_section"
+                    else:
+                        section_type = "header"
+                    break
+            
+            # Check for tables
+            if any(re.search(pattern, line_stripped) for pattern in self.table_patterns):
+                section_type = "table"
+            
+            if section_match or section_type == "table":
+                sections.append({
+                    'start_pos': current_pos,
+                    'line_num': i,
+                    'header': line_stripped,
+                    'type': section_type,
+                    'level': self._determine_header_level(line_stripped)
+                })
+            
+            current_pos += len(line) + 1
+        
+        # Add document end
+        sections.append({
+            'start_pos': len(text),
+            'line_num': len(lines),
+            'header': 'END',
+            'type': 'end',
+            'level': 0
+        })
+        
+        return sections
+    
+    def _determine_header_level(self, header: str) -> int:
+        """Determine the hierarchical level of a header"""
+        # Check for numbered sections (1.1, 2.3.4, etc.)
+        number_match = re.match(r'^(\d+(?:\.\d+)*)', header.strip())
+        if number_match:
+            return len(number_match.group(1).split('.'))
+        
+        # Check for special markers
+        if header.startswith('**') or header.isupper():
+            return 1
+        
+        return 2
+    
+    def extract_hierarchical_chunks(self, text: str, page_metadata: Dict[str, Any]) -> List[Chunk]:
+        """Extract chunks based on document hierarchy."""
+        sections = self.identify_document_structure(text)
+        chunks = []
+        
+        for i in range(len(sections) - 1):
+            current_section = sections[i]
+            next_section = sections[i + 1]
+            
+            # Extract section content
+            section_start = current_section['start_pos']
+            section_end = next_section['start_pos']
+            section_content = text[section_start:section_end].strip()
+            
+            if len(section_content) < self.min_chunk_size:
                 continue
             
-            # Check for special content types
-            content_type = self._detect_content_type(line)
-            if content_type == 'definition':
-                # Flush current block and process definition separately
-                if current_block:
-                    accumulated_content.extend(current_block)
-                    current_block = []
-                self._process_definition(line, section_hierarchy, page_index)
-                continue
-            elif content_type in ['list_item', 'bullet_point']:
-                # Start or continue a list
-                current_block.append(line)
-                continue
+            # Create metadata for this section
+            section_metadata = {
+                **page_metadata,
+                'chunk_type': 'hierarchical',
+                'section_header': current_section['header'],
+                'section_type': current_section['type'],
+                'section_level': current_section['level'],
+                'hierarchical_path': self._build_hierarchical_path(sections, i)
+            }
             
-            current_block.append(line)
-        
-        # Add final block
-        if current_block:
-            accumulated_content.extend(current_block)
-
-    def _detect_section_header(self, line: str) -> Optional[Tuple[int, str]]:
-        """Detect section headers and return (level, title)"""
-        for i, pattern in enumerate(self.section_patterns):
-            if re.match(pattern, line):
-                # Estimate header level based on pattern type and content
-                level = 1
-                if re.match(r'^\d+\.\s+', line):
-                    level = 1
-                elif re.match(r'^\d+\.\d+\s+', line):
-                    level = 2
-                elif re.match(r'^[A-Z][a-z]+', line) and ':' not in line:
-                    level = 1
-                elif 'SECTION' in line or 'ARTICLE' in line:
-                    level = 0  # Top level
-                
-                title = re.sub(r'^\d+\.?\s*', '', line).strip(':').strip()
-                return (level, title)
-        return None
-
-    def _detect_content_type(self, line: str) -> str:
-        """Detect the type of content in a line"""
-        for pattern in self.definition_patterns:
-            if re.match(pattern, line):
-                return 'definition'
-        
-        for pattern in self.list_patterns:
-            if re.match(pattern, line):
-                return 'list_item'
-        
-        return 'text'
-
-    def _update_section_hierarchy(self, hierarchy: List[str], level: int, title: str):
-        """Update section hierarchy based on detected level"""
-        # Ensure hierarchy has enough levels
-        while len(hierarchy) <= level:
-            hierarchy.append("")
-        
-        # Update at the detected level and clear deeper levels
-        hierarchy[level] = title
-        del hierarchy[level + 1:]
-
-    def _create_semantic_chunks(self, content_lines: List[str], section_hierarchy: List[str]):
-        """Create semantically coherent chunks from content lines"""
-        if not content_lines:
-            return
-        
-        text = '\n'.join(content_lines)
-        
-        # Use NLTK for better sentence segmentation
-        sentences = nltk.sent_tokenize(text)
-        
-        # Group sentences into semantic units
-        semantic_groups = self._group_sentences_semantically(sentences)
-        
-        for group in semantic_groups:
-            if not group:
-                continue
-                
-            # Create chunk from semantic group
-            chunk_content = ' '.join(group)
-            
-            # Skip if too small unless it's a definition or special content
-            if len(chunk_content) < self.min_chunk_size and not self._is_special_content(chunk_content):
-                continue
-            
-            # Split large chunks while respecting sentence boundaries
-            if len(chunk_content) > self.max_chunk_size:
-                sub_chunks = self._split_large_chunk(group)
-                for sub_chunk in sub_chunks:
-                    self._add_semantic_chunk(sub_chunk, section_hierarchy)
+            # If section is too large, apply semantic chunking
+            if len(section_content) > self.max_chunk_size:
+                sub_chunks = self.apply_semantic_chunking(
+                    section_content, 
+                    section_metadata,
+                    section_start
+                )
+                chunks.extend(sub_chunks)
             else:
-                self._add_semantic_chunk(chunk_content, section_hierarchy)
+                chunk_id = self._generate_chunk_id(section_content, section_metadata)
+                chunk = Chunk(
+                    content=section_content,
+                    metadata=section_metadata,
+                    chunk_id=chunk_id,
+                    start_char=section_start,
+                    end_char=section_end
+                )
+                chunks.append(chunk)
         
-        content_lines.clear()
-
-    def _group_sentences_semantically(self, sentences: List[str]) -> List[List[str]]:
-        """Group sentences into semantically coherent units"""
+        return chunks
+    
+    def _build_hierarchical_path(self, sections: List[Dict], current_idx: int) -> str:
+        """Build a hierarchical path for the current section"""
+        path_parts = []
+        current_level = sections[current_idx]['level']
+        
+        # Look backwards to find parent sections
+        for i in range(current_idx, -1, -1):
+            section = sections[i]
+            if section['level'] < current_level:
+                path_parts.insert(0, section['header'])
+                current_level = section['level']
+        
+        path_parts.append(sections[current_idx]['header'])
+        return ' > '.join(path_parts)
+    
+    def apply_semantic_chunking(self, text: str, base_metadata: Dict[str, Any], start_offset: int = 0) -> List[Chunk]:
+        """Apply semantic chunking to break text into meaningful segments."""
+        # Split into sentences
+        sentences = self._split_into_sentences(text)
+        
         if not sentences:
             return []
         
-        groups = []
-        current_group = [sentences[0]]
-        current_size = len(sentences[0])
-        
-        for i in range(1, len(sentences)):
-            sentence = sentences[i]
-            
-            # Check semantic coherence
-            should_group = self._should_group_sentences(current_group[-1], sentence)
-            
-            # Check size constraints
-            would_exceed_size = current_size + len(sentence) > self.max_chunk_size
-            
-            if should_group and not would_exceed_size:
-                current_group.append(sentence)
-                current_size += len(sentence)
-            else:
-                # Start new group
-                if current_group:
-                    groups.append(current_group)
-                current_group = [sentence]
-                current_size = len(sentence)
-        
-        if current_group:
-            groups.append(current_group)
-        
-        return groups
-
-    def _should_group_sentences(self, sent1: str, sent2: str) -> bool:
-        """Determine if two sentences should be grouped together"""
-        # Insurance-specific coherence indicators
-        coherence_indicators = [
-            # Pronouns and references
-            (r'\b(this|that|these|those|it|they|such)\b', True),
-            # Continuation words
-            (r'\b(however|therefore|furthermore|additionally|moreover|consequently)\b', True),
-            # List continuation
-            (r'^\s*[\-\*\+\d+\w+[\.\)]\s+', True),
-            # Definition continuation
-            (r'\b(means|includes|refers to|defined as)\b', True),
-            # Insurance terms
-            (r'\b(policy|coverage|premium|deductible|claim|benefit)\b', True),
-        ]
-        
-        for pattern, should_group in coherence_indicators:
-            if re.search(pattern, sent2.lower()):
-                return should_group
-        
-        return False
-
-    def _split_large_chunk(self, sentences: List[str]) -> List[str]:
-        """Split large chunks while maintaining semantic coherence"""
-        chunks = []
-        current_chunk = []
-        current_size = 0
-        
-        for sentence in sentences:
-            if current_size + len(sentence) > self.max_chunk_size and current_chunk:
-                # Add overlap from previous chunk
-                overlap_text = self._get_overlap_text(chunks[-1] if chunks else "", self.chunk_overlap)
-                chunk_text = overlap_text + ' '.join(current_chunk)
-                chunks.append(chunk_text.strip())
-                
-                current_chunk = [sentence]
-                current_size = len(sentence)
-            else:
-                current_chunk.append(sentence)
-                current_size += len(sentence)
-        
-        if current_chunk:
-            overlap_text = self._get_overlap_text(chunks[-1] if chunks else "", self.chunk_overlap)
-            chunk_text = overlap_text + ' '.join(current_chunk)
-            chunks.append(chunk_text.strip())
+        # Group sentences semantically
+        if self.semantic_model and len(sentences) > 2:
+            chunks = self._semantic_grouping_with_model(sentences, base_metadata, start_offset)
+        else:
+            chunks = self._rule_based_semantic_grouping(sentences, base_metadata, start_offset)
         
         return chunks
-
-    def _get_overlap_text(self, previous_chunk: str, overlap_size: int) -> str:
-        """Get overlap text from previous chunk"""
-        if not previous_chunk or overlap_size <= 0:
-            return ""
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences with policy-specific rules"""
+        # Handle special cases in financial policies
+        text = re.sub(r'(\d+\.\d+)%', r'\1 percent', text)  # Handle percentages
+        text = re.sub(r'(Rs\.|INR)\s*(\d+)', r'\1 \2', text)  # Handle currency
+        text = re.sub(r'(\d+)\s*lacs?', r'\1 lacs', text)  # Handle lacs
         
-        # Get last sentences that fit within overlap size
-        sentences = nltk.sent_tokenize(previous_chunk)
-        overlap_sentences = []
-        current_size = 0
+        # Split on sentence boundaries
+        sentences = re.split(self.sentence_endings, text)
         
-        for sentence in reversed(sentences):
-            if current_size + len(sentence) <= overlap_size:
-                overlap_sentences.insert(0, sentence)
-                current_size += len(sentence)
-            else:
-                break
+        # Clean and filter sentences
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 20:  # Minimum sentence length
+                cleaned_sentences.append(sentence)
         
-        return ' '.join(overlap_sentences) + ' ' if overlap_sentences else ""
-
-    def _is_special_content(self, content: str) -> bool:
-        """Check if content is special (definitions, lists, etc.)"""
-        for pattern in self.definition_patterns:
-            if re.search(pattern, content):
-                return True
-        return False
-
-    def _add_semantic_chunk(self, content: str, section_hierarchy: List[str]):
-        """Add a semantically processed chunk"""
-        section_path = ' > '.join(filter(None, section_hierarchy))
-        content_type = self._classify_chunk_type(content)
-        keywords = self._extract_keywords(content)
-        semantic_score = self._calculate_semantic_score(content)
+        return cleaned_sentences
+    
+    def _rule_based_semantic_grouping(self, sentences: List[str], base_metadata: Dict[str, Any], start_offset: int) -> List[Chunk]:
+        """Group sentences using rule-based semantic indicators"""
+        chunks = []
+        current_chunk_sentences = []
+        current_length = 0
+        char_offset = start_offset
         
-        chunk_id = f"chunk_{self.chunk_counter}_{uuid4().hex[:6]}"
-        self.chunk_counter += 1
-        
-        self.chunks.append(DocumentChunk(
-            id=chunk_id,
-            title=f"{section_hierarchy[-1] if section_hierarchy else 'General'} - {content_type.title()}",
-            content=content.strip(),
-            section_path=section_path,
-            chunk_type=content_type,
-            metadata={"word_count": len(content.split())},
-            semantic_score=semantic_score,
-            keywords=keywords
-        ))
-
-    def _classify_chunk_type(self, content: str) -> str:
-        """Classify the type of chunk content"""
-        for pattern in self.definition_patterns:
-            if re.search(pattern, content):
-                return 'definition'
-        
-        list_count = sum(1 for pattern in self.list_patterns 
-                        for _ in re.finditer(pattern, content, re.MULTILINE))
-        
-        if list_count >= 2:
-            return 'list'
-        elif list_count == 1:
-            return 'bullet_point'
-        
-        return 'text'
-
-    def _extract_keywords(self, content: str) -> List[str]:
-        """Extract key terms from content"""
-        # Insurance-specific important terms
-        insurance_terms = [
-            'policy', 'coverage', 'premium', 'deductible', 'claim', 'benefit',
-            'liability', 'damages', 'exclusion', 'endorsement', 'rider',
-            'insured', 'insurer', 'policyholder', 'beneficiary'
-        ]
-        
-        keywords = []
-        content_lower = content.lower()
-        
-        for term in insurance_terms:
-            if term in content_lower:
-                keywords.append(term)
-        
-        # Extract capitalized terms (likely important concepts)
-        capitalized_terms = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', content)
-        keywords.extend(capitalized_terms[:5])  # Limit to top 5
-        
-        return list(set(keywords))
-
-    def _calculate_semantic_score(self, content: str) -> float:
-        """Calculate a semantic coherence score for the chunk"""
-        score = 0.0
-        
-        # Length penalty/bonus
-        word_count = len(content.split())
-        if self.min_chunk_size <= len(content) <= self.max_chunk_size:
-            score += 0.3
-        
-        # Sentence completeness
-        sentences = nltk.sent_tokenize(content)
-        if all(s.strip().endswith(('.', '!', '?', ':')) for s in sentences):
-            score += 0.2
-        
-        # Coherence indicators
-        coherence_words = ['however', 'therefore', 'furthermore', 'this', 'that', 'such']
-        coherence_count = sum(1 for word in coherence_words if word in content.lower())
-        score += min(coherence_count * 0.1, 0.3)
-        
-        # Insurance domain relevance
-        domain_terms = ['policy', 'coverage', 'claim', 'premium', 'insured']
-        domain_count = sum(1 for term in domain_terms if term in content.lower())
-        score += min(domain_count * 0.1, 0.2)
-        
-        return min(score, 1.0)
-
-    def _process_definition(self, line: str, section_hierarchy: List[str], page_index: int):
-        """Process definition lines specially"""
-        for pattern in self.definition_patterns:
-            match = re.match(pattern, line)
-            if match:
-                term = match.group(1)
-                self._add_semantic_chunk(
-                    line, section_hierarchy
-                )
-                break
-
-    def _process_tables(self, tables: List[List[List[str]]], page_index: int, section_hierarchy: List[str]):
-        """Process tables with enhanced metadata"""
-        for i, table in enumerate(tables):
-            if not table:
-                continue
+        for sentence in sentences:
+            sentence_length = len(sentence)
+            
+            # Check if adding this sentence would exceed target size
+            if (current_length + sentence_length > self.target_chunk_size and 
+                current_chunk_sentences and 
+                current_length > self.min_chunk_size):
                 
-            markdown_table = self.convert_table_to_markdown(table)
-            section_path = ' > '.join(filter(None, section_hierarchy))
+                # Create chunk from current sentences
+                content = '. '.join(current_chunk_sentences) + '.'
+                chunk_metadata = {
+                    **base_metadata,
+                    'chunk_type': 'rule_based_semantic',
+                    'sentence_count': len(current_chunk_sentences)
+                }
+                
+                chunk_id = self._generate_chunk_id(content, chunk_metadata)
+                chunk = Chunk(
+                    content=content,
+                    metadata=chunk_metadata,
+                    chunk_id=chunk_id,
+                    start_char=char_offset,
+                    end_char=char_offset + len(content)
+                )
+                chunks.append(chunk)
+                
+                # Start new chunk with overlap
+                if self.overlap_size > 0 and current_chunk_sentences:
+                    overlap_sentences = current_chunk_sentences[-1:]  # Keep last sentence
+                    current_chunk_sentences = overlap_sentences + [sentence]
+                    current_length = sum(len(s) for s in current_chunk_sentences)
+                else:
+                    current_chunk_sentences = [sentence]
+                    current_length = sentence_length
+                
+                char_offset += len(content) - (len(overlap_sentences[0]) if overlap_sentences else 0)
+            else:
+                current_chunk_sentences.append(sentence)
+                current_length += sentence_length
+        
+        # Handle remaining sentences
+        if current_chunk_sentences:
+            content = '. '.join(current_chunk_sentences) + '.'
+            chunk_metadata = {
+                **base_metadata,
+                'chunk_type': 'rule_based_semantic',
+                'sentence_count': len(current_chunk_sentences)
+            }
             
-            # Extract table metadata
-            headers = table[0] if table else []
-            row_count = len(table) - 1 if len(table) > 1 else 0
+            chunk_id = self._generate_chunk_id(content, chunk_metadata)
+            chunk = Chunk(
+                content=content,
+                metadata=chunk_metadata,
+                chunk_id=chunk_id,
+                start_char=char_offset,
+                end_char=char_offset + len(content)
+            )
+            chunks.append(chunk)
+        
+        return chunks
+    
+    def _generate_chunk_id(self, content: str, metadata: Dict[str, Any]) -> str:
+        """Generate unique chunk ID"""
+        # Create a hash from content and key metadata
+        id_string = f"{content[:100]}_{metadata.get('page', 0)}_{metadata.get('chunk_type', '')}"
+        return hashlib.md5(id_string.encode()).hexdigest()[:12]
+    
+    def chunk_document(self, document) -> List[Chunk]:
+        """
+        Main method to chunk a document using the hybrid strategy.
+        """
+        text = document.page_content
+        metadata = document.metadata
+        
+        chunks = []
+        
+        # Handle tables separately if present
+        if metadata.get('has_tables', False):
+            # Remove table content from text for regular processing (simplified)
+            text = re.sub(r'\*\*Tables on Page \d+:\*\*.*?(?=\*\*Page \d+|\Z)', '', text, flags=re.DOTALL)
+        
+        # Apply hierarchical chunking to remaining text
+        hierarchical_chunks = self.extract_hierarchical_chunks(text, metadata)
+        chunks.extend(hierarchical_chunks)
+        
+        # Post-process chunks to ensure quality
+        chunks = self._post_process_chunks(chunks)
+        
+        return chunks
+    
+    def _post_process_chunks(self, chunks: List[Chunk]) -> List[Chunk]:
+        """Post-process chunks to ensure quality and consistency"""
+        processed_chunks = []
+        
+        for chunk in chunks:
+            # Skip empty or too-small chunks
+            if len(chunk.content.strip()) < self.min_chunk_size:
+                continue
             
-            chunk_id = f"chunk_{self.chunk_counter}_{uuid4().hex[:6]}"
-            self.chunk_counter += 1
+            # Clean up content
+            clean_content = self._clean_chunk_content(chunk.content)
             
-            self.chunks.append(DocumentChunk(
-                id=chunk_id,
-                title=f"{section_hierarchy[-1] if section_hierarchy else 'General'} - Table {i+1}",
-                content=f"**Table from Page {page_index+1}:**\n\n{markdown_table}",
-                section_path=section_path,
-                chunk_type="table",
-                metadata={
-                    "page": page_index + 1,
-                    "table_index": i,
-                    "headers": headers,
-                    "row_count": row_count
-                },
-                semantic_score=0.8,  # Tables are generally well-structured
-                keywords=headers[:5] if headers else []
-            ))
-
-    def _post_process_chunks(self):
-        """Post-process chunks for quality improvements"""
-        # Remove very small chunks that aren't definitions
-        self.chunks = [chunk for chunk in self.chunks 
-                      if len(chunk.content) >= self.min_chunk_size 
-                      or chunk.chunk_type in ['definition', 'table']
-                      or any(keyword in chunk.content.lower() for keyword in ['definition', 'means', 'refers to'])]
+            # Update chunk with cleaned content
+            chunk.content = clean_content
+            chunk.metadata['final_char_count'] = len(clean_content)
+            chunk.metadata['final_word_count'] = len(clean_content.split())
+            
+            processed_chunks.append(chunk)
         
-        # Sort chunks by semantic score and section order
-        self.chunks.sort(key=lambda x: (x.section_path, -x.semantic_score))
-
-    def convert_table_to_markdown(self, table: List[List[str]]) -> str:
-        """Enhanced table conversion with better formatting"""
-        if not table:
-            return ""
+        return processed_chunks
+    
+    def _clean_chunk_content(self, content: str) -> str:
+        """Clean chunk content for better readability"""
+        # Remove excessive whitespace
+        content = re.sub(r'\s+', ' ', content)
         
-        # Clean and normalize table data
-        cleaned_table = []
-        for row in table:
-            cleaned_row = [cell.strip().replace('\n', ' ') for cell in row]
-            cleaned_table.append(cleaned_row)
+        # Remove orphaned markdown markers
+        content = re.sub(r'\*\*\s*\*\*', '', content)
         
-        max_cols = max(len(row) for row in cleaned_table) if cleaned_table else 0
+        # Ensure proper sentence endings
+        content = content.strip()
+        if content and not content.endswith(('.', '!', '?', ':')):
+            content += '.'
         
-        # Ensure all rows have the same number of columns
-        for row in cleaned_table:
-            while len(row) < max_cols:
-                row.append("")
-        
-        if not cleaned_table:
-            return ""
-        
-        header = cleaned_table[0]
-        lines = [
-            "| " + " | ".join(header) + " |",
-            "| " + " | ".join(["---"] * len(header)) + " |"
-        ]
-        
-        for row in cleaned_table[1:]:
-            lines.append("| " + " | ".join(row[:len(header)]) + " |")
-        
-        return '\n'.join(lines)
-
-# Replace the RerankHybridRetriever class in rag_service.py with this corrected version
+        return content
 
 from langchain_core.retrievers import BaseRetriever
-from langchain_core.documents import Document
-from typing import List
+from langchain_core.documents import Document as LangchainDocument
 from pydantic import PrivateAttr
-import logging
 
-logger = logging.getLogger(__name__)
-
-class RerankHybridRetriever(BaseRetriever):
-    """Custom hybrid retriever combining vector and BM25 search with reranking."""
+# NEW: Enhanced Retriever with Caching (matching notebook)
+class CachedEnsembleRetriever(BaseRetriever):
+    """Enhanced ensemble retriever with caching and performance optimizations."""
     
     _retrievers: List = PrivateAttr()
     _retriever_names: List[str] = PrivateAttr()
+    _weights: List[float] = PrivateAttr()
     _k: int = PrivateAttr()
+    _retrieval_cache: Dict[str, List[LangchainDocument]] = PrivateAttr(default_factory=dict)
+    _cache_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
-    def __init__(self, retrievers: List, retriever_names: List[str], k: int = 12):
+    def __init__(self, retrievers: List, retriever_names: List[str], weights: List[float], k: int = 8):
         super().__init__()
-        assert len(retrievers) == len(retriever_names), "Retriever names must match retrievers"
+        assert len(retrievers) == len(retriever_names) == len(weights), "All lists must have same length"
         self._retrievers = retrievers
         self._retriever_names = retriever_names
+        self._weights = weights
         self._k = k
+        self._retrieval_cache = {}
+        self._cache_lock = threading.Lock()
 
-    def _get_relevant_documents(self, query: str) -> List[Document]:
-        """Retrieve documents using both retrievers and combine results."""
-        docs = []
+    @lru_cache(maxsize=100)
+    def _cached_retrieve(self, query: str) -> List[LangchainDocument]:
+        """Cache retrieval results for identical queries"""
+        with self._cache_lock:
+            if query in self._retrieval_cache:
+                logger.info("Cache hit for query")
+                return self._retrieval_cache[query]
+            
+            docs = self._get_relevant_documents(query)
+            self._retrieval_cache[query] = docs
+            return docs
+
+    def _get_relevant_documents(self, query: str) -> List[LangchainDocument]:
+        """Retrieve documents using ensemble approach with weighted scoring."""
+        all_docs = []
         seen_contents = set()
 
-        for retriever, name in zip(self._retrievers, self._retriever_names):
+        for retriever, name, weight in zip(self._retrievers, self._retriever_names, self._weights):
             try:
                 if hasattr(retriever, 'get_relevant_documents'):
                     retrieved_docs = retriever.get_relevant_documents(query)
@@ -871,31 +822,29 @@ class RerankHybridRetriever(BaseRetriever):
                     if doc.page_content not in seen_contents:
                         doc.metadata = doc.metadata or {}
                         doc.metadata["source_retriever"] = name
-                        docs.append(doc)
+                        doc.metadata["retriever_weight"] = weight
+                        all_docs.append(doc)
                         seen_contents.add(doc.page_content)
             except Exception as e:
                 logger.warning(f"{name} retrieval failed: {e}")
 
-        return docs[:self._k]
-    
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        """Public method for retrieving documents."""
-        return self._get_relevant_documents(query)
-    
-    def invoke(self, query: str) -> List[Document]:
-        """Alias for get_relevant_documents for compatibility."""
-        return self._get_relevant_documents(query)
+        return all_docs[:self._k]
 
 class OptimizedRAGService:
-    """Optimized RAG service for fast document processing and question answering."""
+    """Optimized RAG service with enhanced caching and batching."""
     
     def __init__(self):
         self.vector_store = None
         self.chain = None
-        self.hybrid_retriever = None
+        self.ensemble_retriever = None
         self._setup_complete = False
         self.embeddings = None
         self.mongo_client = None
+        
+        # Enhanced caching system (from notebook)
+        self._retrieval_cache = {}
+        self._cache_lock = threading.Lock()
+        self._context_cache = {}  # For smart batching
         
     async def _setup_dependencies(self):
         """Setup dependencies only when needed."""
@@ -906,22 +855,24 @@ class OptimizedRAGService:
         from langchain_voyageai import VoyageAIEmbeddings
         from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
         from langchain_openai import ChatOpenAI
-        from langchain_core.documents import Document
+        from langchain_core.documents import Document as LangchainDocument
         from langchain.prompts import PromptTemplate
         from langchain.schema.runnable import RunnablePassthrough
         from langchain_core.output_parsers import StrOutputParser
         from langchain.retrievers import BM25Retriever
+        from langchain.retrievers import EnsembleRetriever  # Import EnsembleRetriever
         from pymongo import MongoClient
         
         # Store in instance
         self.VoyageAIEmbeddings = VoyageAIEmbeddings
         self.MongoDBAtlasVectorSearch = MongoDBAtlasVectorSearch
         self.ChatOpenAI = ChatOpenAI
-        self.Document = Document
+        self.LangchainDocument = LangchainDocument
         self.PromptTemplate = PromptTemplate
         self.RunnablePassthrough = RunnablePassthrough
         self.StrOutputParser = StrOutputParser
         self.BM25Retriever = BM25Retriever
+        self.EnsembleRetriever = EnsembleRetriever  # Add EnsembleRetriever
         self.MongoClient = MongoClient
         
         self._setup_complete = True
@@ -961,110 +912,116 @@ class OptimizedRAGService:
                 text_key="text",
                 embedding_key="embedding"
             )
+
+    @lru_cache(maxsize=100)
+    def _cached_retrieve(self, question: str):
+        """Cache retrieval results for identical questions (from notebook)"""
+        with self._cache_lock:
+            if question in self._retrieval_cache:
+                return self._retrieval_cache[question]
+            
+            docs = self.ensemble_retriever.get_relevant_documents(question)
+            context = "\n\n".join([doc.page_content for doc in docs])
+            self._retrieval_cache[question] = context
+            return context
             
     async def setup_chain(self, documents: List = None):
-        """Setup the RAG chain with hybrid retrieval."""
+        """Setup the RAG chain with EnsembleRetriever (matching notebook parameters)."""
         if self.chain is None:
             await self._setup_dependencies()
             
-            # Enhanced template for better insurance document understanding
+            # Enhanced template for better insurance document understanding (same as notebook)
             template = """
-    You are a reliable assistant specialized in reading and interpreting insurance policy and technical documents.
+Based on the document context below, answer the question factually and precisely.
 
-    Using the DOCUMENT CONTEXT provided, answer the user's question **factually and precisely**, citing **exact terms, limits, exclusions, or sections** if applicable.
+CONTEXT: {context}
 
-    ------------------
-    DOCUMENT CONTEXT:
-    {context}
-    ------------------
+QUESTION: {question}
 
-    Guidelines for answering:
-    - Only answer based on the context. If the answer is not found, say "The document does not mention this explicitly."
-    - Prefer definitions, sections, and limits over general interpretations.
-    - If the question is about coverage, always mention conditions like limits, eligibility, or hospitalization requirements.
-    - If exclusions are present, highlight them clearly.
-    - Avoid making assumptions or paraphrasing loosely.
+INSTRUCTIONS:
+- Answer only from the context provided
+- Cite exact terms, limits, sections if applicable  
+- If not found, state "Not mentioned in document"
+- Include key exclusions/conditions for coverage questions
 
-    Original Question: {question}
-
-    Answer:
-    """
+ANSWER:
+"""
 
             prompt = self.PromptTemplate.from_template(template)
             
-            # Setup vector retriever
-            vector_retriever = self.vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 12})
-            
-            # Setup hybrid retriever
+            # Setup BM25 retriever (matching notebook parameters)
             if documents:
-                # Setup BM25 retriever if documents are provided
                 bm25_retriever = self.BM25Retriever.from_documents(documents)
-                bm25_retriever.k = 12
-                
-                # Create hybrid retriever using the corrected class
-                self.hybrid_retriever = RerankHybridRetriever(
-                    retrievers=[vector_retriever, bm25_retriever],
-                    retriever_names=["vector", "bm25"],
-                    k=12
-                )
+                bm25_retriever.k = 2  # Matching notebook
             else:
-                self.hybrid_retriever = vector_retriever
+                bm25_retriever = None
             
-            model = self.ChatOpenAI(
-                model="gpt-4o-mini", 
-                temperature=0,
-                max_tokens=200,  # Reasonable response length
-                request_timeout=8,  # Aggressive timeout
-                max_retries=1,
-                streaming=False
+            # Setup vector retriever with MMR (matching notebook parameters)
+            vector_retriever = self.vector_store.as_retriever(
+                search_type="mmr",
+                search_kwargs={"fetch_k": 25, "k": 6, "lambda_mult": 0.3}
             )
             
+            # Create EnsembleRetriever with exact notebook parameters
+            if bm25_retriever:
+                self.ensemble_retriever = self.EnsembleRetriever(
+                    retrievers=[vector_retriever, bm25_retriever],
+                    weights=[0.6, 0.4]  # Exact weights from notebook
+                )
+            else:
+                self.ensemble_retriever = vector_retriever
+            
+            # Use faster model (matching notebook)
+            model = self.ChatOpenAI(
+                model_name="gpt-3.5-turbo-1106",  # Exact model from notebook
+                temperature=0,
+                max_tokens=256,  # Matching notebook
+                request_timeout=10,  # Add timeout
+            )
+            
+            # Create chain with cached retrieval
             self.chain = (
-                {"context": self.hybrid_retriever, "question": self.RunnablePassthrough()}
+                {"context": self._cached_retrieve, "question": self.RunnablePassthrough()}
                 | prompt
                 | model
                 | self.StrOutputParser()
             )
+    
     async def process_document_async(self, url: str) -> Tuple[List, List]:
         """Process document asynchronously and return both raw pages and document chunks."""
         await self._setup_dependencies()
         
         def process_sync():
-            # Use the new enhanced parser
-            parser = FinancialPDFParser(
-                table_detection_threshold=3,
-                min_table_rows=2,
-                min_table_cols=2,
-                preserve_formatting=True
+            # Use the new enhanced parser from jupyter notebook
+            parser = PDFParser(max_workers=8)
+            parsed_documents = parser.parse_pdf_from_url(url, use_parallel=True)
+            
+            # Use direct approach from jupyter notebook for chunking
+            chunker = FinancialPolicyChunker(
+                target_chunk_size=1000,     # Ideal chunk size
+                max_chunk_size=1500,        # Maximum allowed
+                min_chunk_size=200,         # Minimum allowed
+                overlap_size=100,           # Overlap between chunks
+                use_semantic_model=False   # False = faster, True = better quality
             )
             
-            # Parse document into pages
-            parsed_pages = parser.parse_document(url)
+            all_chunks = []
             
-            # Create semantic chunks
-            chunker = ImprovedInsurancePDFChunker(
-                max_chunk_size=500, 
-                min_chunk_size=100, 
-                chunk_overlap=100
-            )
-            semantic_chunks = chunker.process_parsed_pages(parsed_pages)
+            # Process each document
+            for doc in parsed_documents:
+                page_chunks = chunker.chunk_document(doc)
+                all_chunks.extend(page_chunks)
             
-            # Convert to Document objects
+            # Convert chunks to langchain Document objects
             documents = [
-                self.Document(
+                self.LangchainDocument(
                     page_content=chunk.content,
-                    metadata={
-                        "id": chunk.id,
-                        "title": chunk.title,
-                        "section_path": chunk.section_path,
-                        "chunk_type": chunk.chunk_type,
-                        **chunk.metadata
-                    }
+                    metadata={**chunk.metadata}
                 )
-                for chunk in semantic_chunks
+                for chunk in all_chunks
             ]
             
-            return documents, parsed_pages
+            return documents, parsed_documents
         
         # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
@@ -1096,21 +1053,15 @@ class OptimizedRAGService:
         
         logger.info(f"Computing embeddings for {len(texts)} valid documents...")
         
-        # Step 2: Compute embeddings in large batches
+        # Step 2: Compute embeddings in batches
         all_embeddings = []
-        text_batches = [texts[i:i + 72] for i in range(0, len(texts), 72)]  # Voyage AI max batch size
-        
-        def compute_embeddings_sync(batch):
-            return self.embeddings.embed_documents(batch)
-        
-        # Process batches asynchronously
-        for batch in text_batches:
-            batch_embeddings = await asyncio.to_thread(compute_embeddings_sync, batch)
+        for batch in self.batch_documents(texts, 72):  # Voyage AI max batch size
+            batch_embeddings = self.embeddings.embed_documents(batch)
             all_embeddings.extend(batch_embeddings)
-        
+
         logger.info("Embeddings computed. Preparing bulk insert...")
-        
-        # Step 3: Prepare documents for bulk insert
+
+        # Step 3: Prepare documents for insert
         bulk_docs = []
         for j, original_index in enumerate(indices):
             doc = documents[original_index]
@@ -1118,55 +1069,155 @@ class OptimizedRAGService:
                 "text": texts[j],
                 "embedding": all_embeddings[j],
             }
-            
-            # Include metadata if available
+
             if hasattr(doc, 'metadata') and doc.metadata:
                 doc_dict.update(doc.metadata)
-                
+
             bulk_docs.append(doc_dict)
-        
-        # Step 4: Bulk insert with optimized settings
+
+        # Step 4: Bulk insert
         collection = self.mongo_client[DB_NAME][COLLECTION_NAME]
-        
         logger.info("Performing bulk insert...")
+
         try:
-            # Use ordered=False for better performance
-            def bulk_insert_sync():
-                result = collection.insert_many(bulk_docs, ordered=False)
-                return len(result.inserted_ids)
-            
-            inserted_count = await asyncio.to_thread(bulk_insert_sync)
+            result = collection.insert_many(bulk_docs, ordered=False)
+            inserted_count = len(result.inserted_ids)
             logger.info(f"Successfully inserted {inserted_count} documents")
             return inserted_count
         except Exception as e:
             logger.error(f"Bulk insert failed: {e}")
             return 0
-    
-    async def answer_questions(self, questions: List[str]) -> List[str]:
-        """Answer multiple questions concurrently."""
-        async def answer_single(question: str) -> str:
+
+    def _safe_invoke(self, question: str) -> str:
+        """Safely invoke chain with error handling (from notebook)"""
+        try:
+            return self.chain.invoke(question)
+        except Exception as e:
+            return f"Processing error: {str(e)}"
+
+    async def answer_questions_parallel(self, questions: List[str], max_workers: int = 3) -> List[str]:
+        """Answer multiple questions concurrently with parallel processing (enhanced from notebook)."""
+        
+        def answer_single(question: str) -> str:
             try:
-                return await asyncio.to_thread(self.chain.invoke, question)
+                return self.chain.invoke(question)
             except Exception as e:
                 logger.error(f"Error answering question '{question}': {e}")
                 return f"Error processing question: {str(e)}"
         
-        # Process questions concurrently with semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(3)  # Limit to 3 concurrent questions
+        results = []
         
-        async def limited_answer(question: str) -> str:
-            async with semaphore:
-                return await answer_single(question)
+        with ThreadPoolExecutor(max_workers=max_workers) as thread_executor:
+            # Submit all questions
+            future_to_question = {
+                thread_executor.submit(answer_single, q): q for q in questions
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_question):
+                question = future_to_question[future]
+                try:
+                    answer = future.result(timeout=30)  # 30 second timeout per question
+                    results.append(answer)
+                except Exception as e:
+                    logger.error(f"Error processing question '{question}': {e}")
+                    results.append(f"Error: {str(e)}")
         
-        tasks = [limited_answer(q) for q in questions]
-        answers = await asyncio.gather(*tasks, return_exceptions=False)
+        return results
+
+    async def answer_questions_smart_batch(self, questions: List[str]) -> List[str]:
+        """Smart batching with context reuse (from notebook)"""
+        # Pre-retrieve all unique contexts
+        unique_contexts = {}
+        question_contexts = {}
         
-        return answers
+        for question in questions:
+            context = self._cached_retrieve(question)
+            context_hash = hash(context)
+            unique_contexts[context_hash] = context
+            question_contexts[question] = context_hash
+        
+        # Process questions with pre-retrieved contexts
+        results = []
+        for question in questions:
+            try:
+                context_hash = question_contexts[question]
+                context = unique_contexts[context_hash]
+                
+                # Direct model call with pre-retrieved context
+                template = """
+Based on the document context below, answer the question factually and precisely.
+
+CONTEXT: {context}
+
+QUESTION: {question}
+
+INSTRUCTIONS:
+- Answer only from the context provided
+- Cite exact terms, limits, sections if applicable  
+- If not found, state "Not mentioned in document"
+- Include key exclusions/conditions for coverage questions
+
+ANSWER:
+"""
+                formatted_prompt = template.format(context=context, question=question)
+                
+                # Use the model directly
+                model = self.ChatOpenAI(
+                    model_name="gpt-3.5-turbo-1106",
+                    temperature=0,
+                    max_tokens=256,
+                    request_timeout=10,
+                )
+                answer = model.invoke(formatted_prompt).content
+                
+                results.append(answer)
+            except Exception as e:
+                results.append(f"Error: {str(e)}")
+        
+        return results
     
-    async def run(self, documents_url: str, questions: List[str]) -> List[str]:
-        """Main run method - optimized for speed with enhanced document processing."""
+    async def answer_questions(self, questions: List[str], method: str = "parallel") -> List[str]:
+        """Answer multiple questions using specified method."""
+        if method == "parallel":
+            return await self.answer_questions_parallel(questions, max_workers=3)
+        elif method == "smart_batch":
+            return await self.answer_questions_smart_batch(questions)
+        else:
+            # Fallback to original method
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            def answer_single(question: str) -> str:
+                try:
+                    return self.chain.invoke(question)
+                except Exception as e:
+                    logger.error(f"Error answering question '{question}': {e}")
+                    return f"Error processing question: {str(e)}"
+            
+            results = []
+            
+            with ThreadPoolExecutor(max_workers=3) as thread_executor:
+                # Submit all questions
+                future_to_question = {
+                    thread_executor.submit(answer_single, q): q for q in questions
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_question):
+                    question = future_to_question[future]
+                    try:
+                        answer = future.result(timeout=30)  # 30 second timeout per question
+                        results.append(answer)
+                    except Exception as e:
+                        logger.error(f"Error processing question '{question}': {e}")
+                        results.append(f"Error: {str(e)}")
+            
+            return results
+    
+    async def run(self, documents_url: str, questions: List[str], processing_method: str = "parallel") -> List[str]:
+        """Main run method - optimized for speed with enhanced document processing and caching."""
         try:
-            logger.info(f"Starting RAG processing for {len(questions)} questions")
+            logger.info(f"Starting RAG processing for {len(questions)} questions using {processing_method} method")
             
             # Setup vector store
             await self.setup_vector_store()
@@ -1176,7 +1227,7 @@ class OptimizedRAGService:
             
             logger.info(f"Processed {len(documents)} document chunks")
             
-            # Setup chain with hybrid retrieval
+            # Setup chain with EnsembleRetriever (matching notebook)
             await self.setup_chain(documents)
             
             # Add to vector store using optimized bulk method
@@ -1185,8 +1236,8 @@ class OptimizedRAGService:
             
             logger.info("Documents added to vector store, answering questions...")
             
-            # Answer questions
-            answers = await self.answer_questions(questions)
+            # Answer questions using specified processing method
+            answers = await self.answer_questions(questions, method=processing_method)
             
             logger.info("RAG processing completed successfully")
             return answers

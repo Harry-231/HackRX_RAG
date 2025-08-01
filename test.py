@@ -9,7 +9,7 @@ load_dotenv()
 
 # Configuration
 API_BASE_URL = "http://localhost:8000"
-API_KEY = os.getenv("API_KEY", "your-secret-api-key")
+API_KEY = os.getenv("SECRET_KEY")
 
 def debug_api_key():
     """Debug API key configuration"""
