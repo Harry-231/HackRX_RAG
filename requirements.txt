@@ -37,4 +37,7 @@ uuid
 rank_bm25
 bs4
 pydantic
-
+sentence_transformers
+pymongo 
+dnspython 
+certifi
