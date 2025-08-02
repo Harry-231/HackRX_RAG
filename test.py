@@ -41,13 +41,18 @@ def test_rag_endpoint():
     }
     
     payload = {
-        "documents": "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D",
+        "documents": "https://drive.google.com/uc?export=download&id=1k5QvmiT0NlbgKAKfEfxJ7nE7mOVcJ3DV",
         "questions": [
-            "What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?",
-            "What is the waiting period for pre-existing diseases?",
-            "Does this policy cover maternity expenses, and what are the limits?",
-            "What is the No Claim Discount (NCD) offered in this policy?",
-            "Are there any sub-limits on room rent and ICU charges for Plan A?"
+            "What was the 'Total Assets' in millions of Rupees for the fiscal year ended March 31, 2021?",
+    "What is the definition of 'Embedded Value (EV)' as provided in the glossary or definitions section?",
+    "List at least three of the 'Internal Risk Factors' that could adversely affect the corporation's business.",
+    "According to the document, what is the stated dividend policy of the corporation?",
+    "Who are the 'Book Running Lead Managers' (BRLMs) appointed for the Offer?",
+    "As of September 30, 2021, what was the total number of individual policies and group policies in force in India?",
+    "What are the key purposes or 'Objects of the Offer' for which the net proceeds will be used?",
+    "In the 'Litigation and Outstanding Proceedings' section, what is the nature of the criminal proceedings involving the corporation?",
+    "What was the date of incorporation of the Life Insurance Corporation of India?",
+    "What is the corporation's policy on investing in cryptocurrencies?"
         ]
     }
     
@@ -63,7 +68,7 @@ def test_rag_endpoint():
             f"{API_BASE_URL}/hackrx/run",
             headers=headers,
             json=payload,
-            timeout=120  # Increased timeout for bulk processing - first run might be slower
+            timeout=600 # Increased timeout for bulk processing - first run might be slower
         )
         
         end_time = time.time()
@@ -163,7 +168,7 @@ def test_minimal_request():
             f"{API_BASE_URL}/hackrx/run",
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=900
         )
         
         end_time = time.time()
